@@ -1,0 +1,178 @@
+////////////////////////////////////////////////////////////////////////////////
+//        ZERO-LAG MACD + KST + PARTIAL R EXIT + KIJUN TRAILING STOP          //
+////////////////////////////////////////////////////////////////////////////////
+//@version=5
+strategy("Zero-Lag MACD + KST + Partial R Exit + Kijun Stop (Brand-New)",
+     overlay=true,
+     initial_capital=100000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100)
+
+//=============================================================================
+// 1) INPUTS
+//=============================================================================
+zmacdFastLen   = input.int(12,  "ZL MACD Fast Length",      minval=1)
+zmacdSlowLen   = input.int(26,  "ZL MACD Slow Length",      minval=1)
+zmacdSignalLen = input.int(9,   "ZL MACD Signal Length",    minval=1)
+
+kstROC1Len     = input.int(10,  "KST ROC1 Len",            minval=1)
+kstROC2Len     = input.int(15,  "KST ROC2 Len",            minval=1)
+kstROC3Len     = input.int(20,  "KST ROC3 Len",            minval=1)
+kstROC4Len     = input.int(30,  "KST ROC4 Len",            minval=1)
+kstSMALen1     = input.int(10,  "KST SMA1 (ROC1)",         minval=1)
+kstSMALen2     = input.int(10,  "KST SMA2 (ROC2)",         minval=1)
+kstSMALen3     = input.int(10,  "KST SMA3 (ROC3)",         minval=1)
+kstSMALen4     = input.int(15,  "KST SMA4 (ROC4)",         minval=1)
+kstSignalLen   = input.int(9,   "KST Signal Smoothing",    minval=1)
+
+partialRR      = input.float(1.5,"Partial Exit @ R multiple", minval=0.1, step=0.1)
+kijunLen       = input.int(26,   "Kijun Trailing Len",        minval=1)
+
+//=============================================================================
+// 2) ZERO-LAG MACD
+//=============================================================================
+// Typical MACD = EMA(fast) - EMA(slow), then an EMA of that for signal.
+// We do a "zero-lag" approach by adjusting source based on the difference from one bar ago.
+
+// Zero-lag EMA function
+f_emaZL(_src, _length) =>
+    if _length <= 1
+        _src
+    else
+        // ZLEMA approach: leadPrice = close + (close - close[lag])
+        // but we can do a simpler "double difference" approach:
+        lag     = math.floor((_length - 1)/2)
+        leadSrc = nz(_src) + (nz(_src) - nz(_src[lag]))
+        ta.ema(leadSrc, _length)
+
+// Compute ZL MACD lines
+fastZl = f_emaZL(close, zmacdFastLen)
+slowZl = f_emaZL(close, zmacdSlowLen)
+macdZL = fastZl - slowZl
+sigZL  = ta.ema(macdZL, zmacdSignalLen)
+histZL = macdZL - sigZL
+
+// Bullish if macdZL > sigZL, Bearish if macdZL < sigZL
+bool macdBull = macdZL > sigZL
+bool macdBear = macdZL < sigZL
+
+//=============================================================================
+// 3) KST (KNOW SURE THING) FOR TREND FILTER
+//=============================================================================
+// KST formula (simplified):
+//   KST =  ( SMA( ROC(close, roc1Len), smaLen1 )
+//          + 2*SMA( ROC(close, roc2Len), smaLen2 )
+//          + 3*SMA( ROC(close, roc3Len), smaLen3 )
+//          + 4*SMA( ROC(close, roc4Len), smaLen4 ) )
+//  Then KSTSignal = SMA(KST, kstSignalLen)
+
+f_roc(_src, _length) =>
+    nz(_src) - nz(_src[_length])
+
+roc1 = f_roc(close, kstROC1Len)
+roc2 = f_roc(close, kstROC2Len)
+roc3 = f_roc(close, kstROC3Len)
+roc4 = f_roc(close, kstROC4Len)
+
+ma1  = ta.sma(roc1, kstSMALen1)
+ma2  = ta.sma(roc2, kstSMALen2)
+ma3  = ta.sma(roc3, kstSMALen3)
+ma4  = ta.sma(roc4, kstSMALen4)
+
+// Weighted sum
+rawKST = (ma1 + 2*ma2 + 3*ma3 + 4*ma4)
+kst    = ta.sma(rawKST, kstSignalLen)
+kstSig = ta.sma(kst,    kstSignalLen)
+
+// Trend filter logic: 
+bool kstBull = kst > kstSig
+bool kstBear = kst < kstSig
+
+//=============================================================================
+// 4) COMBINED ENTRY SIGNAL (STOP & REVERSE)
+//=============================================================================
+// We'll say "go long" if Zero-Lag MACD is bullish *AND* KST is bullish
+// We'll say "go short" if Zero-Lag MACD is bearish *AND* KST is bearish
+
+bool longSignal  = macdBull and kstBull
+bool shortSignal = macdBear and kstBear
+
+if longSignal
+    // If we are short, close that short first
+    if strategy.position_size < 0
+        strategy.close_all("ReverseToLong")
+    // Then open new long
+    strategy.entry("LongZL", strategy.long)
+
+if shortSignal
+    // If we are long, close that long first
+    if strategy.position_size > 0
+        strategy.close_all("ReverseToShort")
+    // Then open new short
+    strategy.entry("ShortZL", strategy.short)
+
+//=============================================================================
+// 5) PARTIAL EXIT @ R MULTIPLE
+//=============================================================================
+// Define R from prior bar's low/high for new positions. Then partial exit at
+// (entry ± partialRR * R).
+
+var float initStopLong  = na
+var float initStopShort = na
+var float partialLongTP = na
+var float partialShortTP= na
+
+bool haveLong  = strategy.position_size > 0
+bool haveShort = strategy.position_size < 0
+
+bool newLong   = haveLong  and strategy.position_size[1] <= 0
+bool newShort  = haveShort and strategy.position_size[1] >= 0
+
+if newLong
+    initStopLong  := low[1]
+    float eL      = strategy.position_avg_price
+    float riskL   = eL - initStopLong
+    partialLongTP := eL + (partialRR * riskL)
+
+if newShort
+    initStopShort := high[1]
+    float eS      = strategy.position_avg_price
+    float riskS   = initStopShort - eS
+    partialShortTP:= eS - (partialRR * riskS)
+
+if haveLong
+    strategy.exit("PartialLongExit", "LongZL", limit=partialLongTP, qty_percent=50)
+if haveShort
+    strategy.exit("PartialShortExit", "ShortZL", limit=partialShortTP, qty_percent=50)
+
+//=============================================================================
+// 6) KIJUN-BASED TRAILING STOP (FINAL EXIT)
+//=============================================================================
+// Kijun-sen from Ichimoku is typically the midpoint of highest high + lowest low over
+// a certain period (e.g., 26). We'll use that as a trailing stop reference.
+
+highestHigh = ta.highest(high, kijunLen)
+lowestLow   = ta.lowest(low,   kijunLen)
+kijunVal    = (highestHigh + lowestLow) / 2
+
+// For a long, if price crosses below kijunVal => exit
+if haveLong and close < kijunVal
+    strategy.close("LongZL", comment="Kijun Stop")
+
+// For a short, if price crosses above kijunVal => exit
+if haveShort and close > kijunVal
+    strategy.close("ShortZL", comment="Kijun Stop")
+
+//=============================================================================
+// 7) PLOTS & ALERTS
+//=============================================================================
+plot(macdZL, color=color.new(color.lime, 0), linewidth=2, title="ZL MACD")
+plot(sigZL,  color=color.new(color.red,  0), linewidth=2, title="ZL MACD Signal")
+
+plot(kst,    color=color.blue,   linewidth=2, title="KST",    display=display.pane)
+plot(kstSig, color=color.orange, linewidth=2, title="KST Sig",display=display.pane)
+
+plot(kijunVal, color=color.purple,  linewidth=2, title="Kijun Stop")
+
+alertcondition(longSignal,  title="ZL MACD + KST => LONG",  message="MACD Bull & KST Bull => Go Long")
+alertcondition(shortSignal, title="ZL MACD + KST => SHORT", message="MACD Bear & KST Bear => Go Short")
